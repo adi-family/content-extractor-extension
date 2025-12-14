@@ -1,3 +1,42 @@
+// PostHog Analytics - lightweight API-only implementation (no external scripts)
+const posthog = (() => {
+  const apiKey = 'phc_3Syrqboc8siQybuxs5VmqQ6WANwHsUIvbH8ILDIrRgX';
+  const apiHost = 'https://eu.i.posthog.com';
+  let distinctId = null;
+
+  const getDistinctId = async () => {
+    if (distinctId) return distinctId;
+    const stored = await chrome.storage.local.get(['posthog_distinct_id']);
+    if (stored.posthog_distinct_id) {
+      distinctId = stored.posthog_distinct_id;
+    } else {
+      distinctId = 'ext_' + Math.random().toString(36).substring(2) + Date.now().toString(36);
+      await chrome.storage.local.set({ posthog_distinct_id: distinctId });
+    }
+    return distinctId;
+  };
+
+  return {
+    capture: async (eventName, properties = {}) => {
+      try {
+        const id = await getDistinctId();
+        await fetch(`${apiHost}/capture/`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({
+            api_key: apiKey,
+            event: eventName,
+            properties: { ...properties, distinct_id: id, $lib: 'chrome-extension' },
+            timestamp: new Date().toISOString()
+          })
+        });
+      } catch (e) {
+        console.debug('Analytics error:', e);
+      }
+    }
+  };
+})();
+
 const queryInput = document.getElementById('query');
 const queryLabel = document.getElementById('queryLabel');
 const actionBtn = document.getElementById('actionBtn');
@@ -26,6 +65,67 @@ const DATA_URL = 'https://raw.githubusercontent.com/adi-family/database/main/app
 const CHUNK_SIZE = 8000;
 const CHUNK_OVERLAP = 500;
 const MAX_ITEMS_PER_CHUNK = 15;
+
+// Retry and parallelization configuration
+const MAX_RETRIES = 3;
+const INITIAL_RETRY_DELAY_MS = 1000;
+const MAX_CONCURRENT_CHUNKS = 3;
+
+// Retry utility with exponential backoff
+const withRetry = async (fn, { maxRetries = MAX_RETRIES, initialDelay = INITIAL_RETRY_DELAY_MS } = {}) => {
+  let lastError;
+  for (let attempt = 0; attempt <= maxRetries; attempt++) {
+    try {
+      return await fn();
+    } catch (error) {
+      lastError = error;
+      const isRetryable = error.message?.includes('rate') ||
+                          error.message?.includes('429') ||
+                          error.message?.includes('timeout') ||
+                          error.message?.includes('overloaded') ||
+                          error.message?.includes('503') ||
+                          error.message?.includes('500');
+
+      if (attempt < maxRetries && isRetryable) {
+        const delay = initialDelay * Math.pow(2, attempt);
+        console.log(`Retry ${attempt + 1}/${maxRetries} after ${delay}ms:`, error.message);
+        await new Promise(resolve => setTimeout(resolve, delay));
+      } else if (!isRetryable) {
+        throw error; // Non-retryable error, fail immediately
+      }
+    }
+  }
+  throw lastError;
+};
+
+// Controlled parallel execution utility
+const processWithConcurrency = async (items, fn, { concurrency = MAX_CONCURRENT_CHUNKS, onProgress } = {}) => {
+  const results = new Array(items.length);
+  let currentIndex = 0;
+  let completedCount = 0;
+
+  const worker = async () => {
+    while (currentIndex < items.length) {
+      const index = currentIndex++;
+      const item = items[index];
+      try {
+        results[index] = { success: true, value: await fn(item, index) };
+      } catch (error) {
+        results[index] = { success: false, error };
+      }
+      completedCount++;
+      onProgress?.(completedCount, items.length);
+    }
+  };
+
+  // Start workers up to concurrency limit
+  const workers = Array(Math.min(concurrency, items.length))
+    .fill(null)
+    .map(() => worker());
+
+  await Promise.all(workers);
+  return results;
+};
 
 // Chunk text using semantic boundaries (paragraphs) with sliding window fallback
 const chunkText = (text) => {
@@ -347,12 +447,60 @@ const geminiKey = document.getElementById('geminiKey');
 const openaiStatus = document.getElementById('openaiStatus');
 const anthropicStatus = document.getElementById('anthropicStatus');
 const geminiStatus = document.getElementById('geminiStatus');
+const openaiLogo = document.getElementById('openaiLogo');
+const anthropicLogo = document.getElementById('anthropicLogo');
+const geminiLogo = document.getElementById('geminiLogo');
 
 let currentMode = 'highlight';
 
-const updateKeyStatus = (statusEl, hasKey) => {
+const updateKeyStatus = (statusEl, logoEl, hasKey) => {
   statusEl.textContent = hasKey ? 'configured' : 'not set';
   statusEl.className = hasKey ? 'key-status configured' : 'key-status missing';
+  if (logoEl) {
+    logoEl.classList.toggle('configured', hasKey);
+  }
+};
+
+const updateProviderKeyStatus = async () => {
+  const keys = await chrome.storage.local.get(['openaiKey', 'anthropicKey', 'geminiKey']);
+  const keyMap = {
+    openai: !!keys.openaiKey,
+    anthropic: !!keys.anthropicKey,
+    google: !!keys.geminiKey
+  };
+
+  providerBtns.forEach(btn => {
+    const provider = btn.dataset.provider;
+    btn.classList.toggle('no-key', !keyMap[provider]);
+  });
+
+  return keyMap;
+};
+
+const updateActionButtonState = async () => {
+  const keys = await chrome.storage.local.get(['openaiKey', 'anthropicKey', 'geminiKey']);
+  const keyMap = {
+    openai: keys.openaiKey,
+    anthropic: keys.anthropicKey,
+    google: keys.geminiKey
+  };
+  const hasKey = !!keyMap[selectedProvider];
+  actionBtn.disabled = !hasKey;
+  actionBtn.title = hasKey ? '' : 'API key required - click Settings to configure';
+
+  if (!hasKey) {
+    status.innerHTML = '<a href="#" class="status-link" id="enterKeyLink">Enter API key</a> to use this provider';
+    status.className = 'status';
+    document.getElementById('enterKeyLink').addEventListener('click', (e) => {
+      e.preventDefault();
+      posthog.capture('Navigation', { to: 'Settings View', from: 'Missing Key Link' });
+      mainView.classList.add('hidden');
+      settingsView.classList.add('visible');
+    });
+  } else if (status.querySelector('.status-link')) {
+    status.textContent = '';
+    status.className = 'status';
+  }
 };
 
 // Initialize: fetch model data then load settings
@@ -366,9 +514,11 @@ const updateKeyStatus = (statusEl, hasKey) => {
     if (result.geminiKey) geminiKey.value = result.geminiKey;
     if (result.lastQuery) queryInput.value = result.lastQuery;
 
-    updateKeyStatus(openaiStatus, !!result.openaiKey);
-    updateKeyStatus(anthropicStatus, !!result.anthropicKey);
-    updateKeyStatus(geminiStatus, !!result.geminiKey);
+    updateKeyStatus(openaiStatus, openaiLogo, !!result.openaiKey);
+    updateKeyStatus(anthropicStatus, anthropicLogo, !!result.anthropicKey);
+    updateKeyStatus(geminiStatus, geminiLogo, !!result.geminiKey);
+    updateProviderKeyStatus();
+    updateActionButtonState();
 
     // Use saved provider/model or apply recommended for current mode
     if (result.selectedProvider && result.selectedModel) {
@@ -398,17 +548,23 @@ queryInput.addEventListener('input', () => {
 // Save API keys on change
 openaiKey.addEventListener('change', () => {
   chrome.storage.local.set({ openaiKey: openaiKey.value });
-  updateKeyStatus(openaiStatus, !!openaiKey.value);
+  updateKeyStatus(openaiStatus, openaiLogo, !!openaiKey.value);
+  updateProviderKeyStatus();
+  updateActionButtonState();
   posthog.capture('API Key Configured', { provider: 'openai', hasKey: !!openaiKey.value });
 });
 anthropicKey.addEventListener('change', () => {
   chrome.storage.local.set({ anthropicKey: anthropicKey.value });
-  updateKeyStatus(anthropicStatus, !!anthropicKey.value);
+  updateKeyStatus(anthropicStatus, anthropicLogo, !!anthropicKey.value);
+  updateProviderKeyStatus();
+  updateActionButtonState();
   posthog.capture('API Key Configured', { provider: 'anthropic', hasKey: !!anthropicKey.value });
 });
 geminiKey.addEventListener('change', () => {
   chrome.storage.local.set({ geminiKey: geminiKey.value });
-  updateKeyStatus(geminiStatus, !!geminiKey.value);
+  updateKeyStatus(geminiStatus, geminiLogo, !!geminiKey.value);
+  updateProviderKeyStatus();
+  updateActionButtonState();
   posthog.capture('API Key Configured', { provider: 'google', hasKey: !!geminiKey.value });
 });
 
@@ -432,6 +588,7 @@ providerBtns.forEach(btn => {
     chrome.storage.local.set({ selectedModel });
     modelList.classList.remove('visible');
     modelBtn.classList.remove('open');
+    updateActionButtonState();
     posthog.capture('AI Provider Selected', { provider: selectedProvider });
   });
 });
@@ -712,16 +869,17 @@ ${pageHtml}`;
 }
 
 async function callAI(provider, model, apiKey, systemPrompt, userPrompt) {
-  let result;
-  if (provider === 'openai') {
-    result = await callOpenAI(model, apiKey, systemPrompt, userPrompt);
-  } else if (provider === 'anthropic') {
-    result = await callAnthropic(model, apiKey, systemPrompt, userPrompt);
-  } else if (provider === 'google') {
-    result = await callGemini(model, apiKey, systemPrompt, userPrompt);
-  } else {
-    throw new Error('Unknown provider: ' + provider);
-  }
+  const result = await withRetry(async () => {
+    if (provider === 'openai') {
+      return await callOpenAI(model, apiKey, systemPrompt, userPrompt);
+    } else if (provider === 'anthropic') {
+      return await callAnthropic(model, apiKey, systemPrompt, userPrompt);
+    } else if (provider === 'google') {
+      return await callGemini(model, apiKey, systemPrompt, userPrompt);
+    } else {
+      throw new Error('Unknown provider: ' + provider);
+    }
+  });
 
   const pricing = getModelPricing(provider, model);
   const cost = calculateCost(result.inputTokens || 0, result.outputTokens || 0, pricing);
@@ -839,24 +997,18 @@ Example response:
 
   // Chunk the text and process each chunk
   const chunks = chunkText(pageText);
-  console.log(`Processing ${chunks.length} chunks`);
+  console.log(`Processing ${chunks.length} chunks with concurrency ${MAX_CONCURRENT_CHUNKS}`);
 
   const allMatches = [];
   let totalCost = 0;
   let totalInputTokens = 0;
   let totalOutputTokens = 0;
 
-  // Process chunks (could be parallelized, but sequential is safer for rate limits)
-  for (let i = 0; i < chunks.length; i++) {
-    const chunk = chunks[i];
-    status.textContent = `Analyzing chunk ${i + 1}/${chunks.length}...`;
-
-    try {
+  // Process chunks in parallel with controlled concurrency
+  const results = await processWithConcurrency(
+    chunks,
+    async (chunk, index) => {
       const result = await callAI(provider, model, apiKey, systemPrompt, chunk);
-
-      if (result.cost !== null) totalCost += result.cost;
-      totalInputTokens += result.inputTokens;
-      totalOutputTokens += result.outputTokens;
 
       let content = result.content
         .replace(/^```(?:json)?\s*/i, '')
@@ -874,10 +1026,26 @@ Example response:
         return { text: m.text, type: m.type || 'sentence' };
       });
 
-      allMatches.push(...normalizedMatches);
-      console.log(`Chunk ${i + 1}: found ${normalizedMatches.length} matches`);
-    } catch (err) {
-      console.error(`Error processing chunk ${i + 1}:`, err);
+      console.log(`Chunk ${index + 1}: found ${normalizedMatches.length} matches`);
+      return { matches: normalizedMatches, cost: result.cost, inputTokens: result.inputTokens, outputTokens: result.outputTokens };
+    },
+    {
+      concurrency: MAX_CONCURRENT_CHUNKS,
+      onProgress: (completed, total) => {
+        status.textContent = `Analyzing chunks ${completed}/${total}...`;
+      }
+    }
+  );
+
+  // Aggregate results
+  for (const result of results) {
+    if (result.success) {
+      allMatches.push(...result.value.matches);
+      if (result.value.cost !== null) totalCost += result.value.cost;
+      totalInputTokens += result.value.inputTokens;
+      totalOutputTokens += result.value.outputTokens;
+    } else {
+      console.error('Chunk processing failed:', result.error);
     }
   }
 
