@@ -3,6 +3,8 @@ const queryInput = document.getElementById('query');
 const highlightBtn = document.getElementById('highlight');
 const clearBtn = document.getElementById('clear');
 const status = document.getElementById('status');
+const supportBtn = document.getElementById('supportBtn');
+const supportIframe = document.getElementById('supportIframe');
 
 // Load saved API key
 chrome.storage.local.get(['apiKey'], (result) => {
@@ -12,6 +14,11 @@ chrome.storage.local.get(['apiKey'], (result) => {
 // Save API key on change
 apiKeyInput.addEventListener('change', () => {
   chrome.storage.local.set({ apiKey: apiKeyInput.value });
+});
+
+// Toggle support iframe
+supportBtn.addEventListener('click', () => {
+  supportIframe.classList.toggle('visible');
 });
 
 highlightBtn.addEventListener('click', async () => {
