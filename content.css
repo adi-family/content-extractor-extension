@@ -1,0 +1,8 @@
+.ai-highlighter-mark {
+  background: #ffeb3b !important;
+  color: #000 !important;
+  padding: 2px 4px !important;
+  border-radius: 3px !important;
+  box-shadow: 0 2px 8px rgba(255,193,7,0.5) !important;
+  display: inline !important;
+}
